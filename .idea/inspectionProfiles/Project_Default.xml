@@ -1,0 +1,68 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="AutoCloseableResource" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="METHOD_MATCHER_CONFIG" value="java.util.Formatter,format,java.io.Writer,append,com.google.common.base.Preconditions,checkNotNull,org.hibernate.Session,close,java.io.PrintWriter,printf,java.io.PrintStream,printf,java.lang.foreign.Arena,ofAuto,java.lang.foreign.Arena,global,org.nd4j.linalg.factory.Nd4j,create" />
+    </inspection_tool>
+    <inspection_tool class="VulnerableLibrariesLocal" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="isIgnoringEnabled" value="true" />
+      <option name="ignoredModules">
+        <list>
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+          <option value="spark-inference-java" />
+        </list>
+      </option>
+      <option name="ignoredPackages">
+        <list>
+          <option value="com.google.code.gson:gson:2.8.0" />
+          <option value="commons-net:commons-net:3.1" />
+          <option value="com.twelvemonkeys.imageio:imageio-metadata:3.1.1" />
+          <option value="org.openjfx:javafx-graphics:11" />
+          <option value="net.java.dev.jna:jna-platform:4.3.0" />
+          <option value="com.fasterxml.jackson.core:jackson-core:2.14.3" />
+          <option value="com.google.protobuf:protobuf-java:3.19.6" />
+          <option value="com.google.guava:guava:16.0.1" />
+          <option value="org.apache.zookeeper:zookeeper:3.6.3" />
+          <option value="org.apache.commons:commons-compress:1.23.0" />
+          <option value="org.scala-lang:scala-library:2.13.8" />
+          <option value="io.netty:netty-codec-http:4.1.96.Final" />
+          <option value="io.netty:netty-codec-http2:4.1.96.Final" />
+          <option value="io.netty:netty-common:4.1.96.Final" />
+          <option value="io.netty:netty-handler:4.1.96.Final" />
+        </list>
+      </option>
+      <option name="ignoredReasons">
+        <list>
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+          <option value="Not exploitable" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
