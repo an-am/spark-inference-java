@@ -59,7 +59,15 @@ public class Main {
             new StructField("IncomeInvestment", DataTypes.IntegerType, true, Metadata.empty()),
             new StructField("AccumulationInvestment", DataTypes.IntegerType, true, Metadata.empty()),
             new StructField("FinancialStatus", DataTypes.FloatType, true, Metadata.empty()),
-            new StructField("ClientId", DataTypes.FloatType, true, Metadata.empty())
+            new StructField("ClientId", DataTypes.IntegerType, true, Metadata.empty())
+    });
+
+    public static final StructType predictionSchema = new StructType(new StructField[]{
+            new StructField("Id", DataTypes.IntegerType, true, Metadata.empty()),
+            new StructField("RiskPropensity", DataTypes.FloatType, true, Metadata.empty()),
+            new StructField("IncomeInvestment", DataTypes.IntegerType, true, Metadata.empty()),
+            new StructField("AccumulationInvestment", DataTypes.IntegerType, true, Metadata.empty()),
+            new StructField("FinancialStatus", DataTypes.FloatType, true, Metadata.empty()),
     });
 
     // Get a database connection
@@ -81,13 +89,33 @@ public class Main {
         return KerasModelImport.importKerasSequentialModelAndWeights(SparkFiles.get(MODEL_PATH), false);
     }
 
-    // Data preparation
+    /** Data‑prep with a single projection: no duplicate columns, all
+        transformations cast to FLOAT to match fullSchema.               */
     public static Dataset<Row> dataPrep(Dataset<Row> df) {
-        return df.drop("ClientId")
-                .selectExpr("*",
-                        "FinancialEducation * log(Wealth) as FinancialStatus",
-                        "(POWER(Wealth, " + fittedLambdaWealth + ") - 1) / " + fittedLambdaWealth + " as Wealth",
-                        "(POWER(Income, " + fittedLambdaIncome + ") - 1) / " + fittedLambdaIncome + " as Income");
+
+        String incomeExpr = "CAST((POWER(Income,"  + fittedLambdaIncome  + ")-1)/"
+                            + fittedLambdaIncome  + " AS float)";
+        String wealthExpr = "CAST((POWER(Wealth,"  + fittedLambdaWealth  + ")-1)/"
+                            + fittedLambdaWealth  + " AS float)";
+        String statusExpr = "CAST(FinancialEducation * log(Wealth) AS float)";
+        Dataset<Row> dafr = df
+                .drop("ClientId")                 // remove unused field
+                .selectExpr(                      // ORDER must match fullSchema
+                        "Id",
+                        "Age",
+                        "Gender",
+                        "FamilyMembers",
+                        "CAST(FinancialEducation AS INT) AS FinancialEducation",
+                        incomeExpr + " AS Income",
+                        wealthExpr + " AS Wealth",
+                        "CAST(IncomeInvestment AS INT) AS IncomeInvestment",
+                        "CAST(AccumulationInvestment AS INT) AS AccumulationInvestment",
+                        statusExpr + " AS FinancialStatus"
+                );
+
+        dafr.printSchema();
+        dafr.show();
+        return dafr;
     }
 
   // Process a micro-batch: perform data preparation, prediction, join, and update DB.
@@ -98,19 +126,10 @@ public class Main {
             public void call(Dataset<Row> df, Long batch_id) throws Exception {
                 Dataset<Row> prepDF = dataPrep(df);
 
-                prepDF
-                        .drop("RiskPropensity")
+                Dataset<Row> predictionDF = prepDF
                         .map(
                                 (MapFunction<Row, Row>) row -> {
-                                    int n = row.size();
-                                    INDArray dataIND = Nd4j.create(1, n - 1);
-
-                                    for(int i = 1; i < n; i++) {
-                                        double v = ((Number) row.get(i)).doubleValue();
-                                        dataIND.putScalar(i-1, v);
-                                    }
-                                    StandardScaler scaler = bScaler.value();
-                                    INDArray scaledIND = scaler.transform(dataIND);
+                                    StandardScaler scaler = getScaler();
 
                                     MultiLayerNetwork model = modelTL.get();
                                     if (model == null) {
@@ -118,27 +137,35 @@ public class Main {
                                         modelTL.set(model);
                                     }
 
-                                    double prediction = model.output(scaledIND).getDouble(0);
+                                    INDArray dataIND = Nd4j.create(1, 9);
+                                    // Put columns: Age, Gender, FamilyMembers, FinancialEducation, Income, Wealth, IncomeInvestment, AccumulationInvestment, FinancialStatus
+                                    // fullSchema: 0 Id, 1 Age, 2 Gender, 3 FamilyMembers, 4 FinancialEducation, 5 RiskPropensity, 6 Income, 7 Wealth, 8 IncomeInvestment, 9 AccumulationInvestment, 10 FinancialStatus, 11 ClientId
 
-                                    Object[] newValues = new Object[n + 1];
-                                    int predIndex = 5;
+                                    dataIND.putScalar(0, row.getAs("Age"));
+                                    dataIND.putScalar(1, row.getAs("Gender"));
+                                    dataIND.putScalar(2, row.getAs("FamilyMembers"));
+                                    dataIND.putScalar(3, row.getAs("FinancialEducation"));
+                                    dataIND.putScalar(4, ((Number) row.getAs("Income")).floatValue());
+                                    dataIND.putScalar(5, ((Number) row.getAs("Wealth")).floatValue());
+                                    dataIND.putScalar(6, ((Number) row.getAs("IncomeInvestment")).intValue());
+                                    dataIND.putScalar(7, ((Number) row.getAs("AccumulationInvestment")).intValue());
+                                    dataIND.putScalar(8, ((Number) row.getAs("FinancialStatus")).floatValue());
 
-                                    for(int i = 0; i < predIndex; i++){
-                                        newValues[i] = row.get(i);
-                                    }
+                                    INDArray scaledIND = scaler.transform(dataIND);
+                                    float prediction = model.output(scaledIND).getFloat(0);
 
-                                    newValues[predIndex] = prediction;
+                                    return RowFactory.create(
+                                            row.getAs("Id"),
+                                            prediction,
+                                            ((Number) row.getAs("IncomeInvestment")).intValue(),
+                                            ((Number) row.getAs("AccumulationInvestment")).intValue(),
+                                            row.getAs("FinancialStatus"),
+                                            null);
+                                },
+                                Encoders.row(predictionSchema));
 
-                                    for(int i = predIndex; i < n; i++){
-                                        newValues[i + 1] = row.get(i);
-                                    }
-
-                                    return RowFactory.create(newValues);
-                                }, Encoders.row(fullSchema))
-                        .foreach(
-                                (ForeachFunction<Row>) row -> {
-                                    queryDb(row);
-                                }
+                        predictionDF.foreach(
+                                (ForeachFunction<Row>) Main::queryDb
                         );
             }
         };
@@ -184,7 +211,7 @@ public class Main {
                                         rs.getFloat("risk_propensity"),
                                         rs.getFloat("income"),
                                         rs.getFloat("wealth"),
-                                        rs.getFloat("income_investment"),
+                                        rs.getInt("income_investment"),
                                         rs.getInt("accumulation_investment"),
                                         rs.getFloat("financial_status"),
                                         rs.getInt("client_id"));
@@ -208,15 +235,21 @@ public class Main {
     public static void queryDb(Row row) {
         try {
             Connection conn = getDbConnection();
+            System.out.println("queryDb row: " + row);
+
             int id = row.getAs("Id");
             float riskPropensity = row.getAs("RiskPropensity");
             float financialStatus = row.getAs("FinancialStatus");
+
             String updateQuery = "UPDATE needs SET risk_propensity = ?, financial_status = ? WHERE id = ?";
+
             PreparedStatement ps = conn.prepareStatement(updateQuery);
             ps.setFloat(1, riskPropensity);
             ps.setFloat(2, financialStatus);
             ps.setInt(3, id);
+
             ps.executeUpdate();
+
             System.out.printf("Updated for id = %d risk_propensity = %f and financial_status = %f%n",
                     id, riskPropensity, financialStatus);
 
@@ -290,10 +323,10 @@ public class Main {
                 .filter("Id is not null");
 
         // Process each micro-batch using foreachBatch.
-        StreamingQuery query = statefulDF.writeStream()
+        StreamingQuery query = statefulDF
+                .writeStream()
                 .foreachBatch(processBatch)
                 .outputMode("update")   // mapGroupsWithState requires Update or Complete
-                .option("checkpointLocation", "/tmp/checkpoint")
                 .start();
 
         query.awaitTermination();
