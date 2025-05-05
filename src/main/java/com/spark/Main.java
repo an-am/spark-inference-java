@@ -1,27 +1,31 @@
 package com.spark;
 import org.apache.spark.api.java.function.*;
-import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.Encoders;
+import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema;
 import org.apache.spark.sql.streaming.*;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.SparkFiles;
 import static org.apache.spark.sql.functions.*;
 
 import java.sql.*;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 
 import org.deeplearning4j.nn.modelimport.keras.KerasModelImport;
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.factory.Nd4j;
-import scala.reflect.ClassTag$;
+import org.postgresql.ds.PGConnectionPoolDataSource;
+
+import javax.sql.PooledConnection;
 
 
 public class Main {
-    private static Connection dbConnection = null;
-    private static Broadcast<StandardScaler> bScaler = null;
+    private static PooledConnection PGPool = getPGPool();
     private static  ThreadLocal<MultiLayerNetwork> modelTL = new ThreadLocal<>();
+    private static ThreadLocal<StandardScaler> scalerTL = new ThreadLocal<>();
 
     // Global constants and configuration
     public static final int NUM_MAX_REQUESTS = 5;
@@ -30,8 +34,6 @@ public class Main {
 
     // PostgreSQL configuration
     public static final String DB_URL = "jdbc:postgresql://localhost:5432/postgres";
-    public static final String DB_USER = "postgres";
-    public static final String DB_PASSWORD = null;
 
     // Filenames; SparkFiles.get(...) will resolve the real path inside each node's userFiles dir
     public static final String SCALER_PATH = "deep_scaler.npz";
@@ -48,7 +50,7 @@ public class Main {
 
     // Full schema for downstream processing (if needed)
     public static final StructType fullSchema = new StructType(new StructField[]{
-            new StructField("Id", DataTypes.IntegerType, false, Metadata.empty()),
+            new StructField("Id", DataTypes.IntegerType, true, Metadata.empty()),
             new StructField("Age", DataTypes.IntegerType, true, Metadata.empty()),
             new StructField("Gender", DataTypes.IntegerType, true, Metadata.empty()),
             new StructField("FamilyMembers", DataTypes.IntegerType, true, Metadata.empty()),
@@ -70,13 +72,18 @@ public class Main {
             new StructField("FinancialStatus", DataTypes.FloatType, true, Metadata.empty()),
     });
 
-    // Get a database connection
-    public static Connection getDbConnection() throws Exception {
-        if (dbConnection == null || dbConnection.isClosed()) {
-            dbConnection = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
-            dbConnection.setAutoCommit(true);
+    public Main() throws SQLException {
+    }
+
+    public static PooledConnection getPGPool() {
+        PGConnectionPoolDataSource PGPool = new PGConnectionPoolDataSource();
+        PGPool.setURL(DB_URL);
+        PGPool.setDefaultAutoCommit(true);
+        try {
+            return PGPool.getPooledConnection();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
         }
-        return dbConnection;
     }
 
     // Get the scaler
@@ -89,8 +96,6 @@ public class Main {
         return KerasModelImport.importKerasSequentialModelAndWeights(SparkFiles.get(MODEL_PATH), false);
     }
 
-    /** Data‑prep with a single projection: no duplicate columns, all
-        transformations cast to FLOAT to match fullSchema.               */
     public static Dataset<Row> dataPrep(Dataset<Row> df) {
 
         String incomeExpr = "CAST((POWER(Income,"  + fittedLambdaIncome  + ")-1)/"
@@ -98,24 +103,21 @@ public class Main {
         String wealthExpr = "CAST((POWER(Wealth,"  + fittedLambdaWealth  + ")-1)/"
                             + fittedLambdaWealth  + " AS float)";
         String statusExpr = "CAST(FinancialEducation * log(Wealth) AS float)";
-        Dataset<Row> dafr = df
+
+        return df
                 .drop("ClientId")                 // remove unused field
                 .selectExpr(                      // ORDER must match fullSchema
                         "Id",
                         "Age",
                         "Gender",
                         "FamilyMembers",
-                        "CAST(FinancialEducation AS INT) AS FinancialEducation",
+                        "FinancialEducation",
                         incomeExpr + " AS Income",
                         wealthExpr + " AS Wealth",
                         "CAST(IncomeInvestment AS INT) AS IncomeInvestment",
                         "CAST(AccumulationInvestment AS INT) AS AccumulationInvestment",
                         statusExpr + " AS FinancialStatus"
                 );
-
-        dafr.printSchema();
-        dafr.show();
-        return dafr;
     }
 
   // Process a micro-batch: perform data preparation, prediction, join, and update DB.
@@ -129,7 +131,12 @@ public class Main {
                 Dataset<Row> predictionDF = prepDF
                         .map(
                                 (MapFunction<Row, Row>) row -> {
-                                    StandardScaler scaler = getScaler();
+                                    StandardScaler scaler = scalerTL.get();
+
+                                    if (scaler == null) {
+                                        scaler = getScaler();
+                                        scalerTL.set(scaler);
+                                    }
 
                                     MultiLayerNetwork model = modelTL.get();
                                     if (model == null) {
@@ -138,13 +145,11 @@ public class Main {
                                     }
 
                                     INDArray dataIND = Nd4j.create(1, 9);
-                                    // Put columns: Age, Gender, FamilyMembers, FinancialEducation, Income, Wealth, IncomeInvestment, AccumulationInvestment, FinancialStatus
-                                    // fullSchema: 0 Id, 1 Age, 2 Gender, 3 FamilyMembers, 4 FinancialEducation, 5 RiskPropensity, 6 Income, 7 Wealth, 8 IncomeInvestment, 9 AccumulationInvestment, 10 FinancialStatus, 11 ClientId
 
                                     dataIND.putScalar(0, row.getAs("Age"));
                                     dataIND.putScalar(1, row.getAs("Gender"));
                                     dataIND.putScalar(2, row.getAs("FamilyMembers"));
-                                    dataIND.putScalar(3, row.getAs("FinancialEducation"));
+                                    dataIND.putScalar(3, ((Number) row.getAs("FinancialEducation")).floatValue());
                                     dataIND.putScalar(4, ((Number) row.getAs("Income")).floatValue());
                                     dataIND.putScalar(5, ((Number) row.getAs("Wealth")).floatValue());
                                     dataIND.putScalar(6, ((Number) row.getAs("IncomeInvestment")).intValue());
@@ -154,13 +159,15 @@ public class Main {
                                     INDArray scaledIND = scaler.transform(dataIND);
                                     float prediction = model.output(scaledIND).getFloat(0);
 
-                                    return RowFactory.create(
+                                    Object[] values = new Object[]{
                                             row.getAs("Id"),
                                             prediction,
                                             ((Number) row.getAs("IncomeInvestment")).intValue(),
                                             ((Number) row.getAs("AccumulationInvestment")).intValue(),
-                                            row.getAs("FinancialStatus"),
-                                            null);
+                                            row.getAs("FinancialStatus")
+                                    };
+
+                                    return new GenericRowWithSchema(values, predictionSchema);
                                 },
                                 Encoders.row(predictionSchema));
 
@@ -171,103 +178,129 @@ public class Main {
         };
 
 
-    public static MapGroupsWithStateFunction<Integer, Row, Integer, Row> update_request_count =
-            new MapGroupsWithStateFunction<Integer, Row, Integer, Row>() {
+    public static FlatMapGroupsWithStateFunction<Integer, Row, Integer, Row> update_request_count =
+            new FlatMapGroupsWithStateFunction<Integer, Row, Integer, Row>() {
                 @Override
-                public Row call(Integer clientId, Iterator<Row> rows, GroupState<Integer> state) throws Exception {
+                public Iterator<Row> call(Integer clientId, Iterator<Row> rows, GroupState<Integer> state) throws Exception {
                     // Process each row in the current batch for this client.
+                    // Get the current count from state; default to 0 if no state is present.
+
+                    int currentCount = state.exists() ? state.get() : 0;
+                    List<Integer> ids = new ArrayList<>();
+
                     while (rows.hasNext()) {
-                        // Get the current count from state; default to 0 if no state is present.
-                        int currentCount = state.exists() ? state.get() : 0;
-
+                        Row row = rows.next();
+                        int id = row.getAs("id");
+                        System.out.println("currentCount: " + currentCount + " id: " + id);
                         if (currentCount < NUM_MAX_REQUESTS) {
-                            // Increment the state counter.
                             currentCount++;
-
-                            // Update the state with the new count.
-                            state.update(currentCount);
-
-                            Row current_row = rows.next();
-                            int rowId = current_row.getAs("id");
-                            System.out.println("Processing row_id: " + rowId);
-                            try {
-                                Connection conn = getDbConnection();
-                                Statement st = conn.createStatement();
-
-                                String query = "SELECT * FROM needs WHERE id = " + rowId;
-
-                                System.out.println("Executing query: " + query);
-                                ResultSet rs = st.executeQuery(query);
-
-                                rs.next();
-
-                                // Retrieve fields from the tuple.
-                                Row row =  RowFactory.create(
-                                        rs.getInt("id"),
-                                        rs.getInt("age"),
-                                        rs.getInt("gender"),
-                                        rs.getInt("family_members"),
-                                        rs.getFloat("financial_education"),
-                                        rs.getFloat("risk_propensity"),
-                                        rs.getFloat("income"),
-                                        rs.getFloat("wealth"),
-                                        rs.getInt("income_investment"),
-                                        rs.getInt("accumulation_investment"),
-                                        rs.getFloat("financial_status"),
-                                        rs.getInt("client_id"));
-
-                                rs.close();
-                                st.close();
-
-                                System.out.println(row);
-                                return row;
-
-                            } catch (Exception e) {
-                                e.printStackTrace();
-                            }
+                            ids.add(id);
                         }
                     }
-                    return RowFactory.create((Object) null);
+
+                    if (ids.isEmpty()) {
+                        List<Row> rowIterator = new ArrayList<>();
+                        Row row = RowFactory.create(null, null, null, null, null, null, null, null, null, null, null, null);
+                        rowIterator.add(row);
+                        return rowIterator.iterator();
+                    }
+
+                    state.update(currentCount);
+
+                    StringBuilder sqlStatement = new StringBuilder("SELECT * FROM needs WHERE id IN (");
+
+                    for (Integer id : ids) {
+                        if (id != null) {
+                            sqlStatement.append(id).append(",");
+                        }
+                    }
+                    sqlStatement.deleteCharAt(sqlStatement.length() - 1).append(")");
+
+                    Connection conn = PGPool.getConnection();
+                    Statement stmt = conn.createStatement();
+                    ResultSet rs = stmt.executeQuery(sqlStatement.toString());
+
+                    List<Row> rowIterator = new ArrayList<>();
+                    while (rs.next()) {
+                        Row row = RowFactory.create(
+                                rs.getInt("id"),
+                                rs.getInt("age"),
+                                rs.getInt("gender"),
+                                rs.getInt("family_members"),
+                                rs.getFloat("financial_education"),
+                                rs.getFloat("risk_propensity"),
+                                rs.getFloat("income"),
+                                rs.getFloat("wealth"),
+                                rs.getInt("income_investment"),
+                                rs.getInt("accumulation_investment"),
+                                rs.getFloat("financial_status"),
+                                rs.getInt("client_id"));
+                        rowIterator.add(row);
+                        System.out.println("row in iterator: " + row);
+                    }
+
+                    rs.close();
+                    stmt.close();
+                    conn.close();
+
+                    return rowIterator.iterator();
                 }
             };
+
 
     // Update PostgreSQL for a single row.
     public static void queryDb(Row row) {
         try {
-            Connection conn = getDbConnection();
-            System.out.println("queryDb row: " + row);
+            Connection conn = PGPool.getConnection();
 
             int id = row.getAs("Id");
             float riskPropensity = row.getAs("RiskPropensity");
             float financialStatus = row.getAs("FinancialStatus");
+            int income = row.getAs("IncomeInvestment");
+            int accumulation = row.getAs("AccumulationInvestment");
 
-            String updateQuery = "UPDATE needs SET risk_propensity = ?, financial_status = ? WHERE id = ?";
+            String updateQuery = "UPDATE needs "
+                    + "SET risk_propensity = ?, financial_status = ? "
+                    + "WHERE id = ?";
 
             PreparedStatement ps = conn.prepareStatement(updateQuery);
+
             ps.setFloat(1, riskPropensity);
             ps.setFloat(2, financialStatus);
-            ps.setInt(3, id);
+            ps.setInt  (3, id);
 
-            ps.executeUpdate();
+            int rows = ps.executeUpdate();
+
+            System.out.printf("id=%d → updated rows=%d%n", id, rows);
 
             System.out.printf("Updated for id = %d risk_propensity = %f and financial_status = %f%n",
                     id, riskPropensity, financialStatus);
+            ps.close();
 
-            String selectQuery = "SELECT * FROM products WHERE (Income = ? OR Accumulation = ?) AND Risk <= ?";
+            String selectQuery = "SELECT * "
+                    + "FROM products "
+                    + "WHERE ("
+                      + "Income = ? "
+                      + "OR Accumulation = ? ) "
+                    + "AND Risk <= ?";
+
             PreparedStatement ps2 = conn.prepareStatement(selectQuery);
-            int incomeInvestment = row.getAs("IncomeInvestment");
-            int accumulationInvestment = row.getAs("AccumulationInvestment");
-            ps2.setInt(1, incomeInvestment);
-            ps2.setInt(2, accumulationInvestment);
+            ps2.setInt  (1, income);
+            ps2.setInt  (2, accumulation);
             ps2.setFloat(3, riskPropensity);
+
             ResultSet rs = ps2.executeQuery();
+
             int count = 0;
             while (rs.next()) {
                 count++;
             }
             System.out.printf("Advised %d products for id = %d%n", count, id);
-            ps.close();
+
+            rs.close();
             ps2.close();
+            conn.close();
+
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -285,13 +318,6 @@ public class Main {
                 .getOrCreate();
 
         spark.sparkContext().setLogLevel("ERROR");
-
-        StandardScaler scaler = getScaler();
-        bScaler = spark
-                .sparkContext()
-                .broadcast(
-                        scaler,
-                        ClassTag$.MODULE$.apply(StandardScaler.class));
 
         // Read from Kafka
         Dataset<Row> kafkaDF = spark
@@ -314,19 +340,21 @@ public class Main {
                 .groupByKey(
                         (MapFunction<Row, Integer>) row -> row.getAs("client_id"),
                         Encoders.INT())
-                .mapGroupsWithState(
+                .flatMapGroupsWithState(
                         update_request_count,
+                        OutputMode.Update(),
                         Encoders.INT(),
                         Encoders.row(fullSchema),
                         GroupStateTimeout.NoTimeout()
                         )
                 .filter("Id is not null");
 
+
         // Process each micro-batch using foreachBatch.
         StreamingQuery query = statefulDF
                 .writeStream()
                 .foreachBatch(processBatch)
-                .outputMode("update")   // mapGroupsWithState requires Update or Complete
+                .outputMode("update")
                 .start();
 
         query.awaitTermination();
