@@ -6,29 +6,39 @@ import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema;
 import org.apache.spark.sql.streaming.*;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.SparkFiles;
+
 import static org.apache.spark.sql.functions.*;
 
+
+
 import java.sql.*;
+import java.time.Instant;
+import java.time.temporal.ChronoField;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.deeplearning4j.nn.modelimport.keras.KerasModelImport;
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork;
 import org.nd4j.linalg.api.ndarray.INDArray;
 import org.nd4j.linalg.factory.Nd4j;
-import org.postgresql.ds.PGConnectionPoolDataSource;
+import org.postgresql.ds.PGPoolingDataSource;
 
-import javax.sql.PooledConnection;
 
 
 public class Main {
-    private static PooledConnection PGPool = getPGPool();
-    private static  ThreadLocal<MultiLayerNetwork> modelTL = new ThreadLocal<>();
+    // Executor‑local connection pool that can hand out multiple sockets
+    private static PGPoolingDataSource DS = initDataSource();
+    private static ThreadLocal<MultiLayerNetwork> modelTL = new ThreadLocal<>();
     private static ThreadLocal<StandardScaler> scalerTL = new ThreadLocal<>();
+    private static final AtomicInteger ROWS_DONE  = new AtomicInteger(0);
+    private static final AtomicLong START_TIME = new AtomicLong(0);
 
     // Global constants and configuration
-    public static final int NUM_MAX_REQUESTS = 5;
+    public static final int NUM_MAX_REQUESTS = 5000;
     public static final String HOST = "localhost:9092";
     public static final String TOPIC = "notifications";
 
@@ -75,15 +85,10 @@ public class Main {
     public Main() throws SQLException {
     }
 
-    public static PooledConnection getPGPool() {
-        PGConnectionPoolDataSource PGPool = new PGConnectionPoolDataSource();
-        PGPool.setURL(DB_URL);
-        PGPool.setDefaultAutoCommit(true);
-        try {
-            return PGPool.getPooledConnection();
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
+    private static PGPoolingDataSource initDataSource() {
+        PGPoolingDataSource ds = new PGPoolingDataSource();
+        ds.setUrl(DB_URL);
+        return ds;
     }
 
     // Get the scaler
@@ -131,6 +136,8 @@ public class Main {
                 Dataset<Row> predictionDF = prepDF
                         .map(
                                 (MapFunction<Row, Row>) row -> {
+
+                                    // !!! Scale in dataprep
                                     StandardScaler scaler = scalerTL.get();
 
                                     if (scaler == null) {
@@ -171,9 +178,28 @@ public class Main {
                                 },
                                 Encoders.row(predictionSchema));
 
-                        predictionDF.foreach(
-                                (ForeachFunction<Row>) Main::queryDb
-                        );
+                predictionDF.foreach(
+                        (ForeachFunction<Row>) Main::queryDb
+                );
+
+                // how many rows were in this micro-batch?
+                long batchRows = df.count();              // df is the original micro-batch
+                // Start the stopwatch the first time *any* micro‑batch
+                // actually contains data (in case stateful operator saw none)
+                if (START_TIME.get() == 0) {
+                    START_TIME.compareAndSet(0, System.nanoTime());
+                }
+                int done = ROWS_DONE.addAndGet((int) batchRows);
+
+                if (done >= NUM_MAX_REQUESTS) {
+                    long elapsedNanos = System.nanoTime() - START_TIME.get();
+                    double secs = elapsedNanos / 1_000_000_000.0;
+
+                    System.out.printf(
+                        "%nProcessed %d rows in %.2f s (%.0f row/s)%n",
+                        done, secs, done / secs);
+
+                }
             }
         };
 
@@ -185,13 +211,18 @@ public class Main {
                     // Process each row in the current batch for this client.
                     // Get the current count from state; default to 0 if no state is present.
 
+                    // first row in the entire job → start the clock
+                    if (START_TIME.get() == 0) {
+                        START_TIME.compareAndSet(0, System.nanoTime());
+                    }
+
                     int currentCount = state.exists() ? state.get() : 0;
                     List<Integer> ids = new ArrayList<>();
 
                     while (rows.hasNext()) {
                         Row row = rows.next();
                         int id = row.getAs("id");
-                        System.out.println("currentCount: " + currentCount + " id: " + id);
+                        //System.out.println("currentCount: " + currentCount + " id: " + id);
                         if (currentCount < NUM_MAX_REQUESTS) {
                             currentCount++;
                             ids.add(id);
@@ -216,7 +247,7 @@ public class Main {
                     }
                     sqlStatement.deleteCharAt(sqlStatement.length() - 1).append(")");
 
-                    Connection conn = PGPool.getConnection();
+                    Connection conn = DS.getConnection();
                     Statement stmt = conn.createStatement();
                     ResultSet rs = stmt.executeQuery(sqlStatement.toString());
 
@@ -236,7 +267,7 @@ public class Main {
                                 rs.getFloat("financial_status"),
                                 rs.getInt("client_id"));
                         rowIterator.add(row);
-                        System.out.println("row in iterator: " + row);
+                        //System.out.println("row in iterator: " + row);
                     }
 
                     rs.close();
@@ -251,7 +282,7 @@ public class Main {
     // Update PostgreSQL for a single row.
     public static void queryDb(Row row) {
         try {
-            Connection conn = PGPool.getConnection();
+            Connection conn = DS.getConnection();
 
             int id = row.getAs("Id");
             float riskPropensity = row.getAs("RiskPropensity");
@@ -271,10 +302,10 @@ public class Main {
 
             int rows = ps.executeUpdate();
 
-            System.out.printf("id=%d → updated rows=%d%n", id, rows);
+            //System.out.printf("id=%d → updated rows=%d%n", id, rows);
 
-            System.out.printf("Updated for id = %d risk_propensity = %f and financial_status = %f%n",
-                    id, riskPropensity, financialStatus);
+            //System.out.printf("Updated for id = %d risk_propensity = %f and financial_status = %f%n",
+            //        id, riskPropensity, financialStatus);
             ps.close();
 
             String selectQuery = "SELECT * "
@@ -295,7 +326,7 @@ public class Main {
             while (rs.next()) {
                 count++;
             }
-            System.out.printf("Advised %d products for id = %d%n", count, id);
+            //System.out.printf("Advised %d products for id = %d%n", count, id);
 
             rs.close();
             ps2.close();
@@ -338,7 +369,13 @@ public class Main {
 
         Dataset<Row> statefulDF = parsedDF
                 .groupByKey(
-                        (MapFunction<Row, Integer>) row -> row.getAs("client_id"),
+                        (MapFunction<Row, Integer>) row -> {
+                            // first record anywhere in the job → start stopwatch
+                            if (START_TIME.get() == 0) {
+                                START_TIME.compareAndSet(0, System.nanoTime());
+                            }
+                            return row.getAs("client_id");
+                        },
                         Encoders.INT())
                 .flatMapGroupsWithState(
                         update_request_count,
@@ -348,7 +385,6 @@ public class Main {
                         GroupStateTimeout.NoTimeout()
                         )
                 .filter("Id is not null");
-
 
         // Process each micro-batch using foreachBatch.
         StreamingQuery query = statefulDF
