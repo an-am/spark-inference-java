@@ -1,4 +1,4 @@
-# Distributed Real-Time Inference pipeline using Spark in Java
+# Distributed Real-Time Inference pipeline using Apache Spark in Java
 
 Input is sourced from a *PostgreSQL database*, which holds personal and financial data
 of users (from now, clients). The system must listen for insertions in a DB table on a
